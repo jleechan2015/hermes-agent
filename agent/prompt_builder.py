@@ -364,6 +364,11 @@ PLATFORM_HINTS = {
         "documents. You can also include image URLs in markdown format ![alt](url) and they "
         "will be downloaded and sent as native media when possible."
     ),
+    "qqbot": (
+        "You are on QQ, a Chinese messaging platform. QQ supports basic text "
+        "and emoji but does not render markdown. Keep responses concise and use "
+        "plain text. Images can be sent via URL or uploaded as attachments."
+    ),
     "wecom": (
         "You are on WeCom (企业微信 / Enterprise WeChat). Markdown formatting is supported. "
         "You CAN send media files natively — to deliver a file to the user, include "

@@ -1913,6 +1913,30 @@ _PLATFORMS = [
              "help": "Phone number or Apple ID to deliver cron results and notifications to."},
         ],
     },
+    {
+        "key": "qqbot",
+        "label": "QQBot",
+        "emoji": "🐱",
+        "token_var": "QQBOT_APPID",
+        "setup_instructions": [
+            "1. Go to https://q.qq.com/ → Bot Open Platform → Create a bot application",
+            "2. Copy the AppID and BotSecret from the bot's credentials page",
+            "3. Enable the necessary intents (public_guild_messages, direct_message, public_messages)",
+            "4. Add the bot to a guild channel, group, or message it directly via C2C",
+            "5. Get your QQ user ID by enabling Developer Mode in QQ settings",
+        ],
+        "vars": [
+            {"name": "QQBOT_APPID", "prompt": "AppID", "password": False,
+             "help": "The AppID from your QQ Bot application credentials."},
+            {"name": "QQBOT_SECRET", "prompt": "BotSecret", "password": True,
+             "help": "The BotSecret (not BotToken) from your QQ Bot application credentials."},
+            {"name": "QQBOT_ALLOWED_USERS", "prompt": "Allowed user IDs (comma-separated, or empty)", "password": False,
+             "is_allowlist": True,
+             "help": "Paste your QQ user ID from step 5 above."},
+            {"name": "QQBOT_HOME_CHANNEL", "prompt": "Home channel ID (for cron/notification delivery, or empty)", "password": False,
+             "help": "Channel ID for delivering cron results and notifications."},
+        ],
+    },
 ]
 
 
@@ -2310,6 +2334,98 @@ def _setup_weixin():
     if user_id:
         print_info(f"  User ID: {user_id}")
 
+def _setup_qqbot():
+    """Interactive setup for QQBot messenger."""
+    print()
+    print(color("  ─── 🐱 QQBot Setup ───", Colors.CYAN))
+
+    existing_appid = get_env_value("QQBOT_APPID")
+    existing_secret = get_env_value("QQBOT_SECRET") or get_env_value("QQBOT_TOKEN")
+
+    if existing_appid and existing_secret:
+        print()
+        print_success("QQBot is already configured.")
+        if not prompt_yes_no("  Reconfigure QQBot?", False):
+            return
+
+    # Check dependency
+    print()
+    print_info("  Checking qq-botpy installation...")
+    try:
+        import botpy
+        print_success("  qq-botpy is installed.")
+    except ImportError:
+        print_warning("  qq-botpy is not installed.")
+        print_info("  Install with: cd ~/.hermes/hermes-agent && uv add qq-botpy")
+        if not prompt_yes_no("  Continue anyway (setup will still save env vars)?", False):
+            return
+
+    # AppID
+    print()
+    print_info("  Enter the AppID from your QQ Bot application credentials.")
+    existing = get_env_value("QQBOT_APPID")
+    if existing:
+        print_info(f"  Current: {existing}")
+    value = prompt("  AppID", password=False)
+    if value:
+        save_env_value("QQBOT_APPID", value)
+        print_success("  Saved QQBOT_APPID")
+    elif not existing:
+        print_warning("  Skipped — QQBot won't work without AppID.")
+        return
+
+    # BotSecret
+    print()
+    print_info("  Enter the BotSecret from your QQ Bot application credentials.")
+    print_info("  (This is the BotSecret, NOT the BotToken — find it on the credentials page)")
+    existing = get_env_value("QQBOT_SECRET") or get_env_value("QQBOT_TOKEN")
+    if existing:
+        print_info("  Current: (hidden)")
+    value = prompt("  BotSecret", password=True)
+    if value:
+        save_env_value("QQBOT_SECRET", value)
+        print_success("  Saved QQBOT_SECRET")
+    elif not existing:
+        print_warning("  Skipped — QQBot won't work without BotSecret.")
+        return
+
+    # Allowed users
+    print()
+    print_info("  The gateway DENIES all users by default for security.")
+    print_info("  Enter QQ user IDs to create an allowlist, or leave empty")
+    print_info("  and you'll be asked about open access next.")
+    existing = get_env_value("QQBOT_ALLOWED_USERS") or ""
+    value = prompt(f"  Allowed user IDs (comma-separated)", password=False)
+    if value:
+        cleaned = value.replace(" ", "")
+        save_env_value("QQBOT_ALLOWED_USERS", cleaned)
+        print_success("  Saved — only these users can interact with the bot.")
+    else:
+        print()
+        access_choices = [
+            "Enable open access (anyone can message the bot)",
+            "Skip for now (bot will deny all users until configured)",
+        ]
+        access_idx = prompt_choice("  How should unauthorized users be handled?", access_choices, 1)
+        if access_idx == 0:
+            save_env_value("QQBOT_ALLOW_ALL_USERS", "true")
+            print_warning("  Open access enabled — anyone can use your bot!")
+        else:
+            print_info("  Skipped — configure later with 'hermes gateway setup'")
+
+    # Home channel
+    print()
+    existing = get_env_value("QQBOT_HOME_CHANNEL") or ""
+    value = prompt(f"  Home channel ID (for cron/notifications, or empty)", password=False)
+    if value:
+        save_env_value("QQBOT_HOME_CHANNEL", value)
+        print_success("  Saved QQBOT_HOME_CHANNEL")
+    else:
+        print_info("  Skipped (can configure later)")
+
+    print()
+    print_success("🐱 QQBot configured!")
+    print_info("  Next: ensure qq-botpy is installed, then restart the gateway.")
 
 def _setup_feishu():
     """Interactive setup for Feishu / Lark — scan-to-create or manual credentials."""
@@ -2660,6 +2776,8 @@ def gateway_setup():
             _setup_signal()
         elif platform["key"] == "weixin":
             _setup_weixin()
+        elif platform["key"] == "qqbot":
+            _setup_qqbot()
         elif platform["key"] == "feishu":
             _setup_feishu()
         else:

@@ -66,6 +66,7 @@ class Platform(Enum):
     WECOM_CALLBACK = "wecom_callback"
     WEIXIN = "weixin"
     BLUEBUBBLES = "bluebubbles"
+    QQBOT = "qqbot"
 
 
 @dataclass
@@ -302,6 +303,9 @@ class GatewayConfig:
                 connected.append(platform)
             # BlueBubbles uses extra dict for local server config
             elif platform == Platform.BLUEBUBBLES and config.extra.get("server_url") and config.extra.get("password"):
+                connected.append(platform)
+            # QQBot uses appid (extra) + secret stored in token field
+            elif platform == Platform.QQBOT and config.extra.get("appid") and config.token:
                 connected.append(platform)
         return connected
     
@@ -1107,6 +1111,24 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             platform=Platform.BLUEBUBBLES,
             chat_id=bluebubbles_home,
             name=os.getenv("BLUEBUBBLES_HOME_CHANNEL_NAME", "Home"),
+        )
+
+    # QQBot — QQBOT_SECRET is the BotSecret used by botpy ≥ 2.x;
+    # QQBOT_TOKEN is kept as a legacy fallback.
+    qqbot_appid = os.getenv("QQBOT_APPID")
+    qqbot_secret = os.getenv("QQBOT_SECRET") or os.getenv("QQBOT_TOKEN")
+    if qqbot_appid and qqbot_secret:
+        if Platform.QQBOT not in config.platforms:
+            config.platforms[Platform.QQBOT] = PlatformConfig()
+        config.platforms[Platform.QQBOT].enabled = True
+        config.platforms[Platform.QQBOT].extra["appid"] = qqbot_appid
+        config.platforms[Platform.QQBOT].token = qqbot_secret
+    qqbot_home = os.getenv("QQBOT_HOME_CHANNEL")
+    if qqbot_home and Platform.QQBOT in config.platforms:
+        config.platforms[Platform.QQBOT].home_channel = HomeChannel(
+            platform=Platform.QQBOT,
+            chat_id=qqbot_home,
+            name=os.getenv("QQBOT_HOME_CHANNEL_NAME", "Home"),
         )
 
     # Session settings
