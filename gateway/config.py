@@ -704,6 +704,7 @@ def _validate_gateway_config(config: "GatewayConfig") -> None:
         Platform.MATTERMOST: "MATTERMOST_TOKEN",
         Platform.MATRIX: "MATRIX_ACCESS_TOKEN",
         Platform.WEIXIN: "WEIXIN_TOKEN",
+        Platform.QQBOT: "QQBOT_SECRET",
     }
     for platform, pconfig in config.platforms.items():
         if not pconfig.enabled:

@@ -17,7 +17,7 @@ Configuration in config.yaml:
 
 Environment variables:
     QQBOT_APPID   - BotAppID
-    QQBOT_SECRET  - BotSecret (used with botpy ≥ 2.x start(appid, secret))
+    QQBOT_SECRET  - BotSecret (used with botpy >= 2.x start(appid, secret))
 """
 
 from __future__ import annotations
@@ -28,8 +28,6 @@ import os
 import re
 import time
 import uuid
-from collections import deque
-from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
@@ -51,24 +49,26 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
-    cache_image_from_bytes,
 )
 
 logger = logging.getLogger(__name__)
 
 MAX_MESSAGE_LENGTH = 2000
 DEDUP_WINDOW_SECONDS = 300
-HISTORY_MAXLEN = 500
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
 
 # C2C / group messages require a monotonically increasing msg_seq per session
 _C2C_MSG_SEQ_MAX = 1_000_000
 
+# Responder cache entries older than this are evicted to prevent unbounded growth.
+_RESPONDER_CACHE_TTL = 600  # 10 minutes
+_RESPONDER_CACHE_MAX = 500
+
 
 def check_qqbot_requirements() -> bool:
     """Check if QQBot dependencies are available and configured."""
     if not QQBOTPY_AVAILABLE:
-        logger.warning("[QQBot] qq-botpy not installed. Run: uv add qq-botpy")
+        logger.warning("[QQBot] qq-botpy not installed. Run: pip install qq-botpy")
         return False
     appid = os.getenv("QQBOT_APPID")
     secret = os.getenv("QQBOT_SECRET")
@@ -78,151 +78,8 @@ def check_qqbot_requirements() -> bool:
     return True
 
 
-# ---------------------------------------------------------------------------
-# Internal hub models
-# ---------------------------------------------------------------------------
-
-@dataclass
-class _PendingEvent:
-    """Normalised inbound event stored in the hub."""
-    event_id: str
-    scene: str        # guild_at | direct_message | c2c | group_at
-    source: str       # "{platform}:{chat_id}"
-    content: str
-    sender_id: str
-    created_at: str
-    attachments: List[Dict] = field(default_factory=list)
-    handled: bool = False
-
-    @classmethod
-    def from_message_event(cls, event: MessageEvent, scene: str) -> "_PendingEvent":
-        src = event.source
-        source_str = f"{src.platform}:{src.chat_id}" if src else ""
-        attachments = [
-            {"url": u, "type": t}
-            for u, t in zip(event.media_urls, event.media_types)
-        ]
-        return cls(
-            event_id=event.message_id or uuid.uuid4().hex,
-            scene=scene,
-            source=source_str,
-            content=event.text,
-            sender_id=str(src.user_id) if src and src.user_id else "",
-            created_at=datetime.now(timezone.utc).isoformat(),
-            attachments=attachments,
-        )
-
-
-@dataclass
-class _ReplyResult:
-    event_id: str
-    ok: bool
-    message: str
-
-
-# Responder is the callable stored alongside each pending event.
-# It accepts the same **kwargs as botpy message.reply() / post_message().
+# Responder callable type — wraps botpy's reply API for group_at / c2c scenes.
 Responder = Callable[..., Awaitable[None]]
-
-
-# ---------------------------------------------------------------------------
-# MessageHub
-# ---------------------------------------------------------------------------
-
-class _MessageHub:
-    """
-    Coroutine-safe message bus embedded in QQBotAdapter.
-
-    Mirrors the interface of qq-bot-mcp's MessageHub so the same MCP
-    tool layer can drive either implementation.
-    """
-
-    def __init__(self) -> None:
-        self._lock = asyncio.Lock()
-        self._condition = asyncio.Condition(self._lock)
-        # event_id -> (_PendingEvent, Responder)
-        self._pending: Dict[str, Tuple[_PendingEvent, Responder]] = {}
-        self._history: deque[_PendingEvent] = deque(maxlen=HISTORY_MAXLEN)
-        self._total_received: int = 0
-
-    async def publish(
-        self,
-        event: MessageEvent,
-        scene: str,
-        responder: Responder,
-    ) -> _PendingEvent:
-        async with self._condition:
-            ev = _PendingEvent.from_message_event(event, scene)
-            self._pending[ev.event_id] = (ev, responder)
-            self._history.appendleft(ev)
-            self._total_received += 1
-            self._condition.notify_all()
-            return ev
-
-    async def pending_count(self) -> int:
-        async with self._lock:
-            return len(self._pending)
-
-    async def total_received(self) -> int:
-        async with self._lock:
-            return self._total_received
-
-    async def list_pending(self, limit: int = 20) -> List[Dict]:
-        async with self._lock:
-            items = [asdict(item[0]) for item in self._pending.values()]
-        return items[: max(1, min(limit, 100))]
-
-    async def list_history(self, limit: int = 20) -> List[Dict]:
-        async with self._lock:
-            items = [asdict(ev) for ev in list(self._history)[: max(1, min(limit, 100))]]
-        return items
-
-    async def wait_event(self, timeout_seconds: int = 15) -> Dict:
-        timeout = max(1, min(timeout_seconds, 120))
-        async with self._condition:
-            if self._pending:
-                first = next(iter(self._pending.values()))[0]
-                return {"ok": True, "event": asdict(first)}
-            try:
-                await asyncio.wait_for(self._condition.wait(), timeout=timeout)
-            except (asyncio.TimeoutError, TimeoutError):
-                return {"ok": False, "message": "timeout"}
-            if not self._pending:
-                return {"ok": False, "message": "timeout"}
-            first = next(iter(self._pending.values()))[0]
-            return {"ok": True, "event": asdict(first)}
-
-    async def reply(self, event_id: str, **kwargs: Any) -> _ReplyResult:
-        """
-        Dispatch a reply via the stored responder.
-
-        Supported kwargs (passed directly to botpy):
-            content, msg_type, image, markdown, ark, embed, media, keyboard
-        """
-        async with self._lock:
-            target = self._pending.pop(event_id, None)
-        if not target:
-            return _ReplyResult(event_id=event_id, ok=False, message="event_id 不存在或已处理")
-
-        ev, responder = target
-        try:
-            await responder(**kwargs)
-            ev.handled = True
-            return _ReplyResult(event_id=event_id, ok=True, message="回复成功")
-        except Exception as exc:
-            logger.error("[QQBot] hub reply failed for %s: %s", event_id, exc)
-            async with self._lock:
-                self._pending[event_id] = (ev, responder)
-            return _ReplyResult(event_id=event_id, ok=False, message=f"回复失败: {exc}")
-
-    async def discard(self, event_id: str) -> _ReplyResult:
-        async with self._lock:
-            target = self._pending.pop(event_id, None)
-        if not target:
-            return _ReplyResult(event_id=event_id, ok=False, message="event_id 不存在或已处理")
-        ev, _ = target
-        ev.handled = True
-        return _ReplyResult(event_id=event_id, ok=True, message="已丢弃")
 
 
 # ---------------------------------------------------------------------------
@@ -234,8 +91,6 @@ class QQBotAdapter(BasePlatformAdapter):
     QQBot adapter using the official qq-botpy SDK.
 
     Supports guild @-messages, direct messages, C2C, and group @-messages.
-    Inbound events are dispatched to the gateway handler AND published to
-    the embedded MessageHub so external tools can poll / reply via the hub.
     """
 
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
@@ -245,7 +100,7 @@ class QQBotAdapter(BasePlatformAdapter):
 
         extra = config.extra or {}
         self._appid: str = str(extra.get("appid") or os.getenv("QQBOT_APPID", "")).strip()
-        # botpy ≥ 2.x uses "secret" (BotSecret), not the old token
+        # botpy >= 2.x uses "secret" (BotSecret), not the old token
         self._secret: str = str(
             config.token
             or extra.get("secret")
@@ -262,9 +117,9 @@ class QQBotAdapter(BasePlatformAdapter):
         self._dm_guild_ids: set = set()
         # Per-session C2C/group msg_seq counter
         self._msg_seq: int = 1
-        # chat_id -> (scene, responder) for group_at / c2c scenes that require
-        # message.reply() instead of post_message / post_dms
-        self._responder_cache: Dict[str, Tuple[str, Responder]] = {}
+        # chat_id -> (scene, responder, timestamp) for group_at / c2c scenes
+        # that require message.reply() instead of post_message / post_dms
+        self._responder_cache: Dict[str, Tuple[str, Responder, float]] = {}
 
         self._intents = (
             botpy.Intents(
@@ -277,14 +132,11 @@ class QQBotAdapter(BasePlatformAdapter):
             else None
         )
 
-        # Embedded message hub
-        self.hub = _MessageHub()
-
     # -- Connection lifecycle ------------------------------------------------
 
     async def connect(self) -> bool:
         if not QQBOTPY_AVAILABLE:
-            msg = "qq-botpy not installed. Run: uv add qq-botpy"
+            msg = "qq-botpy not installed. Run: pip install qq-botpy"
             self._set_fatal_error("missing_dependency", msg, retryable=True)
             logger.error("[%s] %s", self.name, msg)
             return False
@@ -294,19 +146,25 @@ class QQBotAdapter(BasePlatformAdapter):
             logger.error("[%s] %s", self.name, msg)
             return False
 
+        # Prevent duplicate connections with the same credentials
+        if not self._acquire_platform_lock("qqbot-appid", self._appid, "QQBot appid"):
+            return False
+
         try:
             self._bot_client = _QQBotClient(
                 intents=self._intents,
                 adapter=self,
             )
             self._connect_task = asyncio.create_task(self._run_client())
-            self._mark_connected()
+            # Note: _mark_connected() is called from on_ready() once the
+            # WebSocket session is actually established.
             logger.info("[%s] WebSocket task started (appid=%s)", self.name, self._appid)
             return True
         except Exception as exc:
             msg = f"Connection failed: {exc}"
             self._set_fatal_error("connect_error", msg, retryable=True)
             logger.error("[%s] %s", self.name, msg)
+            self._release_platform_lock()
             return False
 
     async def _run_client(self) -> None:
@@ -333,6 +191,7 @@ class QQBotAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
         self._bot_client = None
+        self._release_platform_lock()
         self._mark_disconnected()
         logger.info("[%s] Disconnected", self.name)
 
@@ -353,7 +212,7 @@ class QQBotAdapter(BasePlatformAdapter):
                 content = content[: MAX_MESSAGE_LENGTH - 3] + "..."
 
             # group_at / c2c must reply via message.reply(), not post_message
-            cached = self._responder_cache.get(chat_id)
+            cached = self._get_cached_responder(chat_id)
             if cached:
                 scene, responder = cached
                 kwargs: Dict[str, Any] = {"content": content}
@@ -395,7 +254,7 @@ class QQBotAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Bot not connected")
         try:
             # group_at / c2c: use cached responder
-            cached = self._responder_cache.get(chat_id)
+            cached = self._get_cached_responder(chat_id)
             if cached:
                 scene, responder = cached
                 kwargs: Dict[str, Any] = {"image": image_url}
@@ -441,68 +300,6 @@ class QQBotAdapter(BasePlatformAdapter):
             logger.debug("[%s] get_chat_info failed: %s", self.name, exc)
         return {"name": chat_id, "type": "unknown", "chat_id": chat_id}
 
-    # -- Hub public interface ------------------------------------------------
-
-    async def hub_status(self) -> Dict[str, Any]:
-        return {
-            "running": self._running,
-            "pending": await self.hub.pending_count(),
-            "total_received": await self.hub.total_received(),
-        }
-
-    async def hub_list_pending(self, limit: int = 20) -> List[Dict]:
-        return await self.hub.list_pending(limit)
-
-    async def hub_wait_event(self, timeout_seconds: int = 15) -> Dict:
-        return await self.hub.wait_event(timeout_seconds)
-
-    async def hub_list_history(self, limit: int = 20) -> List[Dict]:
-        return await self.hub.list_history(limit)
-
-    async def hub_reply_event(
-        self,
-        event_id: str,
-        content: Optional[str] = None,
-        msg_type: Optional[int] = None,
-        image: Optional[str] = None,
-        markdown: Optional[Dict] = None,
-        ark: Optional[Dict] = None,
-        embed: Optional[Dict] = None,
-        media: Optional[Dict] = None,
-        keyboard: Optional[Dict] = None,
-    ) -> _ReplyResult:
-        """
-        Reply to a pending hub event.
-
-        All parameters optional — at least one required.
-        Passed directly to botpy (message.reply / post_message / post_dms).
-        """
-        kwargs: Dict[str, Any] = {}
-        if content is not None:
-            kwargs["content"] = content
-        if msg_type is not None:
-            kwargs["msg_type"] = msg_type
-        if image is not None:
-            kwargs["image"] = image
-        if markdown is not None:
-            kwargs["markdown"] = markdown
-        else:
-            kwargs["markdown"] = {"content":content}
-        if ark is not None:
-            kwargs["ark"] = ark
-        if embed is not None:
-            kwargs["embed"] = embed
-        if media is not None:
-            kwargs["media"] = media
-        if keyboard is not None:
-            kwargs["keyboard"] = keyboard
-        if not kwargs:
-            return _ReplyResult(event_id=event_id, ok=False, message="至少需要提供一个回复参数")
-        return await self.hub.reply(event_id=event_id, **kwargs)
-
-    async def hub_discard_event(self, event_id: str) -> _ReplyResult:
-        return await self.hub.discard(event_id)
-
     # -- Internal helpers ----------------------------------------------------
 
     def _next_msg_seq(self) -> int:
@@ -519,6 +316,30 @@ class QQBotAdapter(BasePlatformAdapter):
             return True
         self._seen_messages[msg_id] = now
         return False
+
+    def _get_cached_responder(self, chat_id: str) -> Optional[Tuple[str, Responder]]:
+        """Get a cached responder if it exists and hasn't expired."""
+        entry = self._responder_cache.get(chat_id)
+        if not entry:
+            return None
+        scene, responder, ts = entry
+        if time.time() - ts > _RESPONDER_CACHE_TTL:
+            del self._responder_cache[chat_id]
+            return None
+        return (scene, responder)
+
+    def _evict_stale_responders(self) -> None:
+        """Remove expired entries from the responder cache."""
+        now = time.time()
+        stale = [k for k, (_, _, ts) in self._responder_cache.items()
+                 if now - ts > _RESPONDER_CACHE_TTL]
+        for k in stale:
+            del self._responder_cache[k]
+        # Hard cap to prevent unbounded growth
+        if len(self._responder_cache) > _RESPONDER_CACHE_MAX:
+            sorted_keys = sorted(self._responder_cache, key=lambda k: self._responder_cache[k][2])
+            for k in sorted_keys[:len(self._responder_cache) - _RESPONDER_CACHE_MAX]:
+                del self._responder_cache[k]
 
     @staticmethod
     def _clean_text(text: str) -> str:
@@ -609,16 +430,12 @@ class QQBotAdapter(BasePlatformAdapter):
             timestamp=datetime.now(tz=timezone.utc),
         )
 
-        responder = self._make_responder(message, scene)
-
         # Cache responder for group_at / c2c so send() can route correctly
         if scene in ("group_at", "c2c"):
-            self._responder_cache[chat_id] = (scene, responder)
+            self._responder_cache[chat_id] = (scene, self._make_responder(message, scene), time.time())
+            self._evict_stale_responders()
 
-        # Publish to hub (for MCP / external tool access)
-        await self.hub.publish(event, scene, responder)
-
-        # Also dispatch through the standard gateway handler
+        # Dispatch through the standard gateway handler
         await self.handle_message(event)
 
     # -- QQ event handlers (called by _QQBotClient) --------------------------
