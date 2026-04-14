@@ -677,6 +677,13 @@ DEFAULT_CONFIG = {
         },
     },
 
+    # Developer diagnostics (gateway + agent). Off by default.
+    "diagnostics": {
+        # When true, on context-overflow compression Hermes logs rough token buckets:
+        # system vs conversation messages vs tool JSON schemas, plus per-role counts.
+        "log_context_breakdown": False,
+    },
+
     "cron": {
         # Wrap delivered cron responses with a header (task name) and footer
         # ("The agent cannot see this message").  Set to false for clean output.
@@ -1721,6 +1728,7 @@ _KNOWN_ROOT_KEYS = {
     "fallback_providers", "credential_pool_strategies", "toolsets",
     "agent", "terminal", "display", "compression", "delegation",
     "auxiliary", "custom_providers", "context", "memory", "gateway",
+    "diagnostics",
 }
 
 # Valid fields inside a custom_providers list entry

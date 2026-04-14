@@ -5349,6 +5349,10 @@ class GatewayRunner:
             self._service_tier = self._load_service_tier()
             turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
 
+            _log_ctx_diag = bool(
+                (user_config.get("diagnostics") or {}).get("log_context_breakdown", False)
+            )
+
             def run_sync():
                 agent = AIAgent(
                     model=turn_route["model"],
@@ -5371,6 +5375,7 @@ class GatewayRunner:
                     user_id=source.user_id,
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
+                    log_context_breakdown=_log_ctx_diag,
                 )
 
                 return agent.run_conversation(
@@ -7419,6 +7424,9 @@ class GatewayRunner:
         import queue
         
         user_config = _load_gateway_config()
+        _log_ctx_diag = bool(
+            (user_config.get("diagnostics") or {}).get("log_context_breakdown", False)
+        )
         platform_key = _platform_config_key(source.platform)
 
         from hermes_cli.tools_config import _get_platform_tools
@@ -7921,6 +7929,7 @@ class GatewayRunner:
             agent.reasoning_config = reasoning_config
             agent.service_tier = self._service_tier
             agent.request_overrides = turn_route.get("request_overrides")
+            agent.log_context_breakdown = _log_ctx_diag
 
             # Background review delivery — send "💾 Memory updated" etc. to user
             def _bg_review_send(message: str) -> None:

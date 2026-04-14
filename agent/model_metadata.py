@@ -1099,3 +1099,44 @@ def estimate_request_tokens_rough(
     if tools:
         total_chars += len(str(tools))
     return (total_chars + 3) // 4
+
+
+def estimate_context_breakdown_rough(
+    api_messages: List[Dict[str, Any]],
+    *,
+    tools: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Split rough token estimate into system / messages / tool-schema buckets.
+
+    Uses the same ~4 chars/token ceiling heuristic as ``estimate_messages_tokens_rough``.
+    Tool *definitions* are not part of ``api_messages``; pass ``tools`` so their
+    JSON schema payload is counted (often 20k+ tokens with large toolsets).
+    """
+    system_prompt = ""
+    rest = list(api_messages or [])
+    if rest and rest[0].get("role") == "system":
+        _c = rest[0].get("content")
+        system_prompt = _c if isinstance(_c, str) else str(_c or "")
+        rest = rest[1:]
+
+    by_role: Dict[str, int] = {}
+    rest_chars = 0
+    for msg in rest:
+        role = str(msg.get("role") or "unknown")
+        n = (len(str(msg)) + 3) // 4
+        by_role[role] = by_role.get(role, 0) + n
+        rest_chars += len(str(msg))
+
+    system_tokens = (len(system_prompt) + 3) // 4
+    messages_tokens = (rest_chars + 3) // 4
+    tools_tokens = (len(str(tools)) + 3) // 4 if tools else 0
+
+    return {
+        "system": system_tokens,
+        "messages": messages_tokens,
+        "tools": tools_tokens,
+        "total": system_tokens + messages_tokens + tools_tokens,
+        "by_role": dict(sorted(by_role.items(), key=lambda kv: -kv[1])),
+        "api_message_count": len(api_messages or []),
+        "tool_count": len(tools) if tools else 0,
+    }

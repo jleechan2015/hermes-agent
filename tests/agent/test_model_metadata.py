@@ -25,6 +25,7 @@ from agent.model_metadata import (
     _strip_provider_prefix,
     estimate_tokens_rough,
     estimate_messages_tokens_rough,
+    estimate_context_breakdown_rough,
     get_model_context_length,
     get_next_probe_tier,
     get_cached_context_length,
@@ -102,6 +103,25 @@ class TestEstimateMessagesTokensRough:
         ]}
         result = estimate_messages_tokens_rough([msg])
         assert result == (len(str(msg)) + 3) // 4
+
+
+class TestEstimateContextBreakdownRough:
+    def test_splits_system_tools_and_roles(self):
+        tools = [{"type": "function", "function": {"name": "x", "description": "d"}}]
+        msgs = [
+            {"role": "system", "content": "a" * 40},
+            {"role": "user", "content": "b" * 40},
+            {"role": "assistant", "content": "c" * 40},
+        ]
+        bd = estimate_context_breakdown_rough(msgs, tools=tools)
+        assert bd["system"] == (40 + 3) // 4
+        rest_chars = len(str(msgs[1])) + len(str(msgs[2]))
+        assert bd["messages"] == (rest_chars + 3) // 4
+        assert bd["tools"] == (len(str(tools)) + 3) // 4
+        assert bd["total"] == bd["system"] + bd["messages"] + bd["tools"]
+        assert bd["by_role"]["user"] == (len(str(msgs[1])) + 3) // 4
+        assert bd["by_role"]["assistant"] == (len(str(msgs[2])) + 3) // 4
+        assert bd["tool_count"] == 1
 
 
 # =========================================================================

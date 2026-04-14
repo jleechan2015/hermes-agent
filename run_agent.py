@@ -85,7 +85,10 @@ from agent.prompt_builder import (
 )
 from agent.model_metadata import (
     fetch_model_metadata,
-    estimate_tokens_rough, estimate_messages_tokens_rough, estimate_request_tokens_rough,
+    estimate_tokens_rough,
+    estimate_messages_tokens_rough,
+    estimate_request_tokens_rough,
+    estimate_context_breakdown_rough,
     get_next_probe_tier, parse_context_limit_from_error,
     parse_available_output_tokens_from_error,
     save_context_length, is_local_endpoint,
@@ -604,6 +607,7 @@ class AIAgent:
         checkpoint_max_snapshots: int = 50,
         pass_session_id: bool = False,
         persist_session: bool = True,
+        log_context_breakdown: bool = False,
     ):
         """
         Initialize the AI Agent.
@@ -643,6 +647,10 @@ class AIAgent:
             skip_context_files (bool): If True, skip auto-injection of SOUL.md, AGENTS.md, and .cursorrules
                 into the system prompt. Use this for batch processing and data generation to avoid
                 polluting trajectories with user-specific persona or project instructions.
+            log_context_breakdown (bool): When True, emit structured rough token buckets (system /
+                messages-by-role / tool schemas) to logs and the status sink when context
+                overflow compression runs. Configure via ``diagnostics.log_context_breakdown``
+                in gateway ``config.yaml``.
         """
         _install_safe_stdio()
 
@@ -667,6 +675,7 @@ class AIAgent:
         self.skip_context_files = skip_context_files
         self.pass_session_id = pass_session_id
         self.persist_session = persist_session
+        self.log_context_breakdown = bool(log_context_breakdown)
         self._credential_pool = credential_pool
         self.log_prefix_chars = log_prefix_chars
         self.log_prefix = f"{log_prefix} " if log_prefix else ""
@@ -1710,6 +1719,33 @@ class AIAgent:
         if not force and self._has_stream_consumers() and not self._executing_tools:
             return
         self._safe_print(*args, **kwargs)
+
+    def _log_context_size_breakdown(
+        self,
+        api_messages: List[Dict[str, Any]],
+        *,
+        approx_tokens_line: int,
+        reason: str,
+        compression_attempt: int | None = None,
+        max_attempts: int | None = None,
+    ) -> None:
+        """Emit rough token buckets when ``log_context_breakdown`` is enabled."""
+        if not getattr(self, "log_context_breakdown", False):
+            return
+        bd = estimate_context_breakdown_rough(api_messages, tools=self.tools)
+        att = ""
+        if compression_attempt is not None and max_attempts is not None:
+            att = f" attempt={compression_attempt}/{max_attempts}"
+        line = (
+            f"{self.log_prefix}[context_breakdown] reason={reason}{att} "
+            f"line_approx={approx_tokens_line:,} "
+            f"buckets_total={bd['total']:,} "
+            f"(system={bd['system']:,} messages={bd['messages']:,} tools={bd['tools']:,}; "
+            f"tools_n={bd['tool_count']}) "
+            f"by_role={bd['by_role']}"
+        )
+        logging.info(line)
+        self._vprint(line, force=True)
 
     def _should_start_quiet_spinner(self) -> bool:
         """Return True when quiet-mode spinner output has a safe sink.
@@ -9345,6 +9381,13 @@ class AIAgent:
                                 "error": f"Context length exceeded: max compression attempts ({max_compression_attempts}) reached.",
                                 "partial": True
                             }
+                        self._log_context_size_breakdown(
+                            api_messages,
+                            approx_tokens_line=approx_tokens,
+                            reason="context_overflow_compress",
+                            compression_attempt=compression_attempts,
+                            max_attempts=max_compression_attempts,
+                        )
                         self._emit_status(f"🗜️ Context too large (~{approx_tokens:,} tokens) — compressing ({compression_attempts}/{max_compression_attempts})...")
 
                         original_len = len(messages)
